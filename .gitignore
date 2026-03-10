@@ -36,3 +36,5 @@ vector_store/*
 
 # Logs
 *.log
+
+course_db_cache.pkl
