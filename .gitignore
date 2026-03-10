@@ -1,6 +1,38 @@
-venv/
+# Python
 __pycache__/
-.vector_cache/
-vector_store/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environment files
 .env
+.env.*
+
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+
+# Local model / vector build cache
+.vector_cache/
+
+# Runtime artifacts
+memory_store/*
+!memory_store/.gitkeep
+!memory_store/README.md
+
+vector_store/*
+!vector_store/.gitkeep
+!vector_store/README.md
+
+# Logs
+*.log
