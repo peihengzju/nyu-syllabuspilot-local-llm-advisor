@@ -23,6 +23,16 @@ def stubbed_app():
     rag_mod = types.ModuleType("rag_module")
     rag_mod.LAST_RETRIEVAL_DEBUG = {}
     rag_mod.refine_question_with_qwen = lambda q: f"refined:{q}"
+    def classify_intent(q):
+        low = q.lower()
+        if "compare" in low:
+            return {"intent": "comparison", "confidence": 0.95, "scores": {}, "reason": "stub"}
+        if "select" in low:
+            return {"intent": "selection", "confidence": 0.95, "scores": {}, "reason": "stub"}
+        if "syllabus" in low:
+            return {"intent": "syllabus", "confidence": 0.95, "scores": {}, "reason": "stub"}
+        return {"intent": "chat", "confidence": 0.95, "scores": {}, "reason": "stub"}
+    rag_mod.classify_intent = classify_intent
     rag_mod.is_course_comparison_question = lambda q: "compare" in q.lower()
     rag_mod.is_course_selection_question = lambda q: "select" in q.lower()
     rag_mod.is_syllabus_question = lambda q: "syllabus" in q.lower()

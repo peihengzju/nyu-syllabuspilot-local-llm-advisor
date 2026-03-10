@@ -71,12 +71,8 @@
 
     /* Logo Styling */
     .nyu-logo-img {
-      height: 45px;
+      height: 56px;
       width: auto;
-      background: white; /* Optional: in case transparency is weird */
-      padding: 2px;
-      border-radius: 2px;
-      /* If your image has a purple background built-in, remove 'background: white' */
     }
 
     .header-title {
@@ -89,6 +85,7 @@
     }
 
     .header-btn {
+      border: none;
       background: rgba(255,255,255,0.15);
       color: white;
       text-decoration: none;
@@ -97,6 +94,7 @@
       font-size: 14px;
       font-weight: 600;
       transition: background 0.2s;
+      cursor: pointer;
     }
     .header-btn:hover {
       background: rgba(255,255,255,0.25);
@@ -286,10 +284,13 @@
 
   <header class="site-header">
     <div class="header-left">
-      <img src="/static/nyu-logo.png" alt="NYU Logo" class="nyu-logo-img">
+      <img src="{{ logo_url }}" alt="NYU Logo" class="nyu-logo-img">
       <div class="header-title">Weekly Schedule</div>
     </div>
-    <a href="/" class="header-btn">Back Home</a>
+    <div>
+      <button id="downloadScheduleBtn" class="header-btn" type="button" style="margin-right:8px;">Download Image</button>
+      <button id="backHomeBtn" class="header-btn" type="button">Back Home</button>
+    </div>
   </header>
 
   <main class="content-wrapper">
@@ -394,5 +395,43 @@
     </div>
   </main>
 
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<script>
+  (function() {
+    async function downloadScheduleImage() {
+      const card = document.querySelector(".schedule-card");
+      if (!card || typeof html2canvas === "undefined") return;
+      const canvas = await html2canvas(card, {
+        backgroundColor: "#ffffff",
+        scale: 2,
+        useCORS: true,
+      });
+      const a = document.createElement("a");
+      a.href = canvas.toDataURL("image/png");
+      a.download = "nyu-weekly-schedule.png";
+      a.click();
+    }
+
+    window.downloadScheduleImage = downloadScheduleImage;
+
+    const dlBtn = document.getElementById("downloadScheduleBtn");
+    if (dlBtn) {
+      dlBtn.addEventListener("click", function() {
+        downloadScheduleImage();
+      });
+    }
+
+    const backBtn = document.getElementById("backHomeBtn");
+    if (!backBtn) return;
+    backBtn.addEventListener("click", function() {
+      if (window.opener && !window.opener.closed) {
+        window.opener.focus();
+        window.close();
+        return;
+      }
+      window.location.href = "{{ home_url }}";
+    });
+  })();
+</script>
 </body>
 </html>

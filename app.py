@@ -1,65 +1,90 @@
 # app.py
+import json
+import logging
+import os
 import re
+import time
+import uuid
+from datetime import datetime
 from itertools import count
 
 from flask import Flask, request, jsonify, render_template
-
-
-
-from schedule_module import try_generate_schedule_from_dialog
-# ===== 你自己封装的模块 =====
-from memory_module import reset_memories, add_memory_from_turn
-from rag_module import (
-    
-    retrieve_context,
-    LAST_RETRIEVAL_DEBUG,
-    analyze_request_with_qwen,
-
+# ===== Local project modules =====
+from memory_module import (
+    reset_memories,
+    add_memory_from_turn,
+    export_all_memories,
 )
+from rag_module import (
+    refine_question_with_qwen,
+    classify_intent,
+    is_course_selection_question,
+    is_syllabus_question,
+    is_course_comparison_question,
+    retrieve_context,
+)
+import rag_module
 from advisor_module import (
     chat_with_memory_only,
     call_qwen_with_rag,
     answer_course_selection_question,
     answer_course_comparison_question,
-    
+)
+from schedule_module import try_generate_schedule_from_dialog, reset_schedule_state
+from config.paths import (
+    RESET_MEMORY_ON_INDEX,
+    INTENT_CONFIDENCE_THRESHOLD,
+    ENABLE_REQUEST_LOG,
 )
 
-# 如果你把 Qwen HTTP 调用封到 qwen_client 里，这里不用再管 URL/模型名
-# from qwen_client import call_qwen  # 现在 app.py 不直接用 Qwen 了
+# Qwen HTTP calls are encapsulated in qwen_client.
+# app.py does not call Qwen directly.
 
 app = Flask(__name__)
 
 TURN_COUNTER = count(1)  # 1,2,3,...
+MEMORY_LOG_PATH = os.path.join("memory_store", "memory_export.log")
 
+# Memory export logger
+mem_logger = logging.getLogger("memory_export")
+if not mem_logger.handlers:
+    os.makedirs(os.path.dirname(MEMORY_LOG_PATH), exist_ok=True)
+    handler = logging.FileHandler(MEMORY_LOG_PATH, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    mem_logger.setLevel(logging.INFO)
+    mem_logger.addHandler(handler)
 
-# ============== Web 页 + 重置记忆 ==============
+# ============== Web Page + Memory Reset ==============
 
 @app.route("/", methods=["GET"])
 def index():
     """
-    打开主页面时顺带清空记忆（你之前说“刷新就初始化”）。
-    如果以后不想自动清空，把 reset_memories() 注释掉即可。
+    Optionally reset memory when opening the main page.
+    Controlled by RESET_MEMORY_ON_INDEX.
     """
-    reset_memories()
+    if RESET_MEMORY_ON_INDEX:
+        reset_memories()
     return render_template("index.html")
 
 
 @app.route("/reset_memory", methods=["POST"])
 def reset_memory_route():
     """
-    提供一个显式重置记忆的接口，前端按钮可以调用这个。
+    Explicit endpoint to reset memory.
     """
     reset_memories()
+    reset_schedule_state()
     return jsonify({"status": "ok"})
 
 
-# ============== 主问答接口 ==============
+# ============== Main Q&A Endpoint ==============
 
 @app.route("/ask", methods=["POST"])
 def ask():
-    # ---------------------------------------------------------
-    # 1) 获取用户输入
-    # ---------------------------------------------------------
+    request_id = uuid.uuid4().hex[:12]
+    t0 = time.perf_counter()
+
+    # 1) Read question
     if request.is_json:
         question = request.json.get("question", "")
     else:
@@ -69,160 +94,199 @@ def ask():
         return jsonify({"error": "Question must not be empty."}), 400
 
     try:
-        # =========================================================
-        # [REMOVED] 删除了原先在这里的 "优先尝试课表生成" 代码块
-        # 现在完全依赖 LLM 的意图识别来触发
-        # =========================================================
+        refined = None
+        route = None
+        intent = "unknown"
+        confidence = 0.0
 
-        answer = ""
-        
-        # ---------------------------------------------------------
-        # 2) 智能分析 (The Analyzer)
-        #    现在 analyze_request_with_qwen 会返回 "SCHEDULE" 意图
-        # ---------------------------------------------------------
-        question_intent, refined_query = analyze_request_with_qwen(question)
-        
-        print(f"[DEBUG] User Question: {question}")
-        print(f"[DEBUG] Intent: {question_intent} | Query: {refined_query}")
+        handled, payload = try_generate_schedule_from_dialog(question=question)
+        if handled:
+            route = "schedule"
+            if payload.get("type") == "html":
+                answer = "Here is your generated weekly schedule."
+                turn_id = next(TURN_COUNTER)
+                add_memory_from_turn(question, answer, source_turn=turn_id)
+                if request.is_json:
+                    return jsonify(
+                        {
+                            "answer": answer,
+                            "request_id": request_id,
+                            "intent": "schedule",
+                            "schedule_html": payload.get("html", ""),
+                            "conflicts": payload.get("conflicts", []),
+                        }
+                    )
+                return payload.get("html", "")
 
-        # ---------------------------------------------------------
-        # 3) 意图路由 (Route Logic)
-        # ---------------------------------------------------------
-        
-        # === [NEW] 新增：处理排课意图 ===
-        if question_intent == "SCHEDULE":
-            # 调用排课状态机/逻辑
-            try:
-                handled, payload = try_generate_schedule_from_dialog(
-                    question=question,
-                    answer="", 
-                    request_obj=request
+            answer = payload.get("message", "I need more information to build the schedule.")
+            turn_id = next(TURN_COUNTER)
+            add_memory_from_turn(question, answer, source_turn=turn_id)
+            if request.is_json:
+                return jsonify(
+                    {
+                        "answer": answer,
+                        "request_id": request_id,
+                        "intent": "schedule",
+                        "candidates": payload.get("candidates", []),
+                    }
                 )
-            except Exception as e:
-                print(f"[Schedule Error] {e}")
-                handled, payload = False, None
+            return answer
 
-            if handled:
-                # A) 如果生成了 HTML 课表 -> 直接返回结果
-                if payload["type"] == "html":
-                    note = "Here is your updated schedule:"
-                    if request.is_json:
-                        return jsonify({
-                            "answer": note,
-                            "intent": question_intent,
-                            "schedule_html": payload["html"],
-                            "conflicts": payload.get("conflicts", [])
-                        })
-                    else:
-                        return payload["html"]
+        intent_debug = classify_intent(question)
+        intent = intent_debug["intent"]
+        confidence = float(intent_debug["confidence"])
 
-                # B) 如果需要确认 (Confirmation) -> 直接返回询问
-                if payload["type"] == "ask_for_confirmation":
-                    return jsonify(payload)
-            
-            else:
-                # 识别到了排课意图，但没提取到课程号（例如用户只说了 "Add course"）
-                answer = "I understood you want to manage your schedule, but I need the course code. Please specify it (e.g., 'Add 6143')."
-
-        # === 比较模式 ===
-        elif question_intent == "COMPARISON":
-            answer = answer_course_comparison_question(
-                original_question=question,
-                retrieval_question=refined_query
-            )
-        
-        # === 选课模式 ===
-        elif question_intent == "SELECTION":
-            answer = answer_course_selection_question(
-                original_question=question,
-                retrieval_question=refined_query
-            )
-
-        # === 大纲详情 ===
-        elif question_intent == "SYLLABUS":
+        # 2) Intent routing: comparison / selection / syllabus / general chat
+        if confidence < INTENT_CONFIDENCE_THRESHOLD and intent != "chat":
+            # Conservative fallback for low-confidence intent.
+            route = "fallback_rag_low_confidence"
+            refined = refine_question_with_qwen(question)
             answer = call_qwen_with_rag(
                 original_question=question,
-                retrieval_question=refined_query
+                retrieval_question=refined,
             )
 
-        # === 闲聊模式 ===
-        else: 
+        elif intent == "comparison" or is_course_comparison_question(question):
+            # Course comparison with dual-syllabus retrieval + memory.
+            route = "comparison"
+            refined = refine_question_with_qwen(question)
+            answer = answer_course_comparison_question(
+                original_question=question,
+                retrieval_question=refined,
+            )
+
+        elif intent == "selection" or is_course_selection_question(question):
+            # Course recommendation from COURSE_PROFILES + syllabus + memory.
+            route = "selection"
+            refined = refine_question_with_qwen(question)
+            answer = answer_course_selection_question(
+                original_question=question,
+                retrieval_question=refined,
+            )
+
+        elif intent == "syllabus" or is_syllabus_question(question):
+            # Syllabus detail Q&A with syllabus RAG + memory.
+            route = "syllabus_rag"
+            refined = refine_question_with_qwen(question)
+            answer = call_qwen_with_rag(
+                original_question=question,
+                retrieval_question=refined,
+            )
+
+        else:
+            # General conversation: memory-only chat without syllabus retrieval.
+            route = "memory_chat"
             answer = chat_with_memory_only(question)
-            # 防御性替换
+            # Safety: suppress random course-code mentions.
             answer = re.sub(
                 r"\b[A-Z]{2,4}-?GY\s*\d{3,4}\b",
                 "this course",
                 answer,
             )
 
-        # ---------------------------------------------------------
-        # 4) 写入长短期记忆
-        # ---------------------------------------------------------
-        turn_id = next(TURN_COUNTER) 
+        # 3) Persist memory for every turn.
+        turn_id = next(TURN_COUNTER)
         add_memory_from_turn(question, answer, source_turn=turn_id)
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": f"Failed to process request: {str(e)}"}), 500
+        if ENABLE_REQUEST_LOG:
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            app.logger.info(
+                "request_id=%s route=%s intent=%s confidence=%.3f refined=%s latency_ms=%d",
+                request_id,
+                route,
+                intent,
+                confidence,
+                bool(refined),
+                elapsed_ms,
+            )
 
-    # ---------------------------------------------------------
-    # 5) 返回响应 (AI Chat Response)
-    # ---------------------------------------------------------
+    except Exception as e:
+        return jsonify({
+            "error": f"Failed to process request: {e}",
+            "request_id": request_id,
+        }), 500
+
+    # 4) Response format: JSON mode / form mode
     if request.is_json:
         return jsonify({
-            "answer": answer, 
-            "intent": question_intent,
-            "refined_query": refined_query
+            "answer": answer,
+            "request_id": request_id,
+            "intent": intent,
         })
     else:
-        # HTML 简易返回
         return f"""
         <html>
         <head><meta charset="utf-8"><title>Answer</title></head>
         <body>
-          <h3>Intent: <span style="color:blue">{question_intent}</span></h3>
-          <p><b>Query:</b> {refined_query}</p>
           <p><b>Question:</b> {question}</p>
+          <p><b>Request ID:</b> {request_id}</p>
           <hr>
-          <pre style="white-space: pre-wrap;">{answer}</pre>
-          <br>
+          <pre>{answer}</pre>
           <a href="/">Back to main page</a>
         </body>
         </html>
         """
 
 
-# ============== RAG debug 接口 (保持不变) ==============
+# ============== RAG Debug Endpoint ==============
 
 @app.route("/debug_retrieval", methods=["POST"])
 def debug_retrieval():
     """
-    调试 syllabus 检索结果：
-    - 返回 refine 后的 query
-    - 返回 retrieve_context 的上下文
-    - 返回 rag_module 里的 LAST_RETRIEVAL_DEBUG
+    Debug syllabus retrieval:
+    - Return refined query
+    - Return retrieved contexts
+    - Return rag_module.LAST_RETRIEVAL_DEBUG
     """
     data = request.get_json(force=True, silent=True) or {}
     question = data.get("question", "")
     if not question.strip():
         return jsonify({"error": "Question must not be empty."}), 400
 
-    intent, refined = analyze_request_with_qwen(question)
+    request_id = uuid.uuid4().hex[:12]
+    refined = refine_question_with_qwen(question)
     contexts = retrieve_context(
         question=refined,
         analysis_question=question,
     )
 
     return jsonify({
+        "request_id": request_id,
         "question": question,
         "refined": refined,
         "num_contexts": len(contexts),
         "contexts": contexts,
-        "debug": LAST_RETRIEVAL_DEBUG,
+        "debug": rag_module.LAST_RETRIEVAL_DEBUG,
     })
+
+
+@app.route("/log_memories", methods=["POST"])
+def log_memories():
+    """
+    Called by frontend on close/refresh to snapshot memory into logs.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    reason = data.get("reason", "unload")
+    now = datetime.utcnow().isoformat()
+
+    try:
+        snapshot = export_all_memories()
+        mem_logger.info(
+            "Memory snapshot reason=%s at=%s count=%d payload=%s",
+            reason,
+            now,
+            len(snapshot),
+            json.dumps(snapshot, ensure_ascii=False),
+        )
+        return jsonify({"status": "logged", "count": len(snapshot)})
+    except Exception as e:
+        mem_logger.exception("Failed to export memories on unload: %s", e)
+        return jsonify({"error": "Failed to export memories"}), 500
 
 
 if __name__ == "__main__":
     print("RAG + Qwen server is running.")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "5000"))
+    debug = os.getenv("FLASK_DEBUG", "1") == "1"
+    app.run(host=host, port=port, debug=debug)

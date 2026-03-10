@@ -1,16 +1,17 @@
 # memory_module.py
 """
-负责“对话记忆”的模块：
-- 存储到 memory_store/memories.json
-- 用 Faiss 做向量检索 (mem_index.faiss)
-- 提供：reset_memories / add_memory_from_turn / retrieve_memories / format_memories_block
+Conversation memory module:
+- Stores memories in memory_store/memories.json
+- Uses Faiss for vector retrieval (mem_index.faiss)
+- Exposes: reset_memories / add_memory_from_turn / retrieve_memories / format_memories_block
 """
 
 import os
+import re
 import json
 from dataclasses import dataclass, asdict
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Literal
+from typing import List, Dict, Any, Optional, Literal, Set
 
 import faiss
 import numpy as np
@@ -20,28 +21,30 @@ from config.paths import (
     MEMORY_DIR,
     MEMORY_INDEX_PATH,
     MEMORY_TEXTS_PATH,
+    MEMORY_REINDEX_EVERY,
     E5_MODEL_NAME,
+    E5_LOCAL_ONLY,
 )
 from qwen_client import call_qwen
 
-# ========== 基础配置 ==========
+# ========== Base Configuration ==========
 
 MemorySlot = Literal["profile", "preference", "fact", "recent"]
 
-# 记忆槽类型（现在主要是做说明）
+# Memory slot types.
 MEMORY_SLOTS = {
-    "profile",        # 个人信息：姓名、学校、专业、背景
-    "preference",     # 长期偏好：想学什么、风格偏好
-    "fact",           # 重要事实：比如“我是 NYU ECE”、“我想走 AI infra”
-    "recent",         # 临时上下文：最近 5～10 轮
+    "profile",        # Personal profile: name, school, major, background
+    "preference",     # Long-term preferences
+    "fact",           # Important facts
+    "recent",         # Short-lived recent context
 }
 
-# 不同槽采用不同的过期 / 权重策略
+# Slot-specific expiry / weighting policy.
 MEMORY_EXPIRY_DAYS: Dict[MemorySlot, Optional[int]] = {
-    "profile":   None,   # 永不过期
-    "preference": 365,   # 软过期，一年
-    "fact":      180,    # 半年
-    "recent":     7,     # 一周
+    "profile":   None,   # never expires
+    "preference": 365,   # soft expiry: one year
+    "fact":      180,    # half year
+    "recent":     7,     # one week
 }
 
 
@@ -49,14 +52,14 @@ MEMORY_EXPIRY_DAYS: Dict[MemorySlot, Optional[int]] = {
 class MemoryItem:
     id: int
     slot: MemorySlot
-    text: str                  # 可能是摘要后的文本
-    importance: int            # 0 = 一般，1 = 中等，2 = 很重要，3 = 更重要（聚合）
-    created_at: str            # ISO 字符串
-    last_used_at: str          # 上次被检索到的时间
-    extra: Dict[str, Any]      # 额外 meta, 比如 { "source_turn": 12, "kind": "career_direction" }
+    text: str                  # Possibly summarized text
+    importance: int            # 0=low, 1=medium, 2=high, 3=aggregated high
+    created_at: str            # ISO timestamp
+    last_used_at: str          # Last retrieval timestamp
+    extra: Dict[str, Any]      # Extra metadata, e.g. {"source_turn": 12, "kind": "career_direction"}
 
 
-# ========== 初始化目录和文件 ==========
+# ========== Initialization ==========
 
 os.makedirs(MEMORY_DIR, exist_ok=True)
 
@@ -64,27 +67,89 @@ if not os.path.exists(MEMORY_TEXTS_PATH):
     with open(MEMORY_TEXTS_PATH, "w", encoding="utf-8") as f:
         json.dump([], f, ensure_ascii=False, indent=2)
 
-# embedding 模型（记忆这边也用 e5）
-_emb_model = SentenceTransformer(E5_MODEL_NAME)
+# Embedding model (memory also uses E5), lazily loaded.
+_emb_model = None
+_emb_error = None
+_emb_warned = False
 
-# 记忆向量索引，全局变量
-if os.path.exists(MEMORY_INDEX_PATH):
-    mem_index = faiss.read_index(MEMORY_INDEX_PATH)
-else:
-    # 没有 index，用 dummy 算出维度
-    dummy = _emb_model.encode(
-        ["query: dummy"], convert_to_numpy=True, normalize_embeddings=True
-    )[0]
-    d = len(dummy)
-    mem_index = faiss.IndexFlatIP(d)  # 内积，embedding 已经 normalize，相当于余弦相似度
-    faiss.write_index(mem_index, MEMORY_INDEX_PATH)
+mem_index = None
+_mem_index_loaded = False
 
+def _load_embedding_model():
+    global _emb_model, _emb_error
+    if _emb_model is not None:
+        return _emb_model
+    if _emb_error is not None:
+        return None
+    kwargs = {}
+    if E5_LOCAL_ONLY:
+        kwargs["local_files_only"] = True
+    try:
+        try:
+            _emb_model = SentenceTransformer(E5_MODEL_NAME, **kwargs)
+        except TypeError:
+            _emb_model = SentenceTransformer(E5_MODEL_NAME)
+        return _emb_model
+    except Exception as exc:
+        _emb_error = exc
+        return None
+
+def _note_embedding_unavailable():
+    global _emb_warned
+    if _emb_warned or _emb_error is None:
+        return
+    print(f"[Memory] Embedding model unavailable: {_emb_error}. Falling back to lexical retrieval.")
+    _emb_warned = True
 
 def _save_mem_index() -> None:
+    if mem_index is None:
+        return
     faiss.write_index(mem_index, MEMORY_INDEX_PATH)
 
+def _ensure_mem_index(items: List[MemoryItem]):
+    global mem_index, _mem_index_loaded
+    model = _load_embedding_model()
+    if model is None:
+        _note_embedding_unavailable()
+        return None
+    if not _mem_index_loaded:
+        _mem_index_loaded = True
+        if os.path.exists(MEMORY_INDEX_PATH):
+            mem_index = faiss.read_index(MEMORY_INDEX_PATH)
+        else:
+            mem_index = None
+    if mem_index is None:
+        _rebuild_mem_index(items)
+    return mem_index
 
-# ========== 通用工具 ==========
+_TOKEN_RE = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]")
+
+def _tokenize(text: str) -> List[str]:
+    if not text:
+        return []
+    return _TOKEN_RE.findall(text.lower())
+
+def _lexical_score(q_tokens: Set[str], text: str) -> float:
+    if not q_tokens:
+        return 0.0
+    t_tokens = set(_tokenize(text))
+    if not t_tokens:
+        return 0.0
+    overlap = len(q_tokens & t_tokens)
+    return overlap / (len(q_tokens) + 1)
+
+
+def _jaccard(a: Set[str], b: Set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    if union == 0:
+        return 0.0
+    return inter / union
+
+
+# ========== Common Utilities ==========
 
 def _build_dialogue_snippet(question: str, answer: str) -> str:
     return f"User: {question}\nAssistant: {answer}"
@@ -92,7 +157,7 @@ def _build_dialogue_snippet(question: str, answer: str) -> str:
 
 def summarize_dialogue_with_qwen(snippet: str, max_words: int = 80) -> str:
     """
-    把一段较长的对话压缩成一条简短摘要，用于记忆存储。
+    Compress a longer dialogue into a short memory sentence.
     """
     system_prompt = (
         "You are a memory compression assistant.\n"
@@ -120,12 +185,12 @@ def summarize_dialogue_with_qwen(snippet: str, max_words: int = 80) -> str:
         summary = (summary or "").strip()
         return summary if summary else snippet[:200]
     except Exception:
-        # 摘要失败就退回截断原文
+        # Fallback: truncated raw snippet.
         return snippet[:200]
 
 
 def _load_memories() -> List[MemoryItem]:
-    # 文件不存在 → 没有任何记忆
+    # Missing file -> no memories.
     if not os.path.exists(MEMORY_TEXTS_PATH):
         return []
 
@@ -133,13 +198,13 @@ def _load_memories() -> List[MemoryItem]:
         with open(MEMORY_TEXTS_PATH, "r", encoding="utf-8") as f:
             content = f.read().strip()
 
-        # 文件存在但被清空了（内容是空字符串）→ 当作空列表
+        # Empty file content -> treat as [].
         if not content:
             return []
 
         arr = json.loads(content)
     except Exception:
-        # 文件内容损坏 / 不是合法 JSON → 重置为 []
+        # Corrupted or invalid JSON -> reset to [].
         arr = []
         with open(MEMORY_TEXTS_PATH, "w", encoding="utf-8") as f:
             json.dump([], f, ensure_ascii=False, indent=2)
@@ -154,17 +219,31 @@ def _save_memories(items: List[MemoryItem]) -> None:
 
 def _rebuild_mem_index(items: Optional[List[MemoryItem]] = None) -> None:
     """
-    根据当前所有 MemoryItem 重新构建 mem_index。
-    聚合记忆会修改已有条目，所以不能只做 incremental add。
+    Rebuild mem_index from all current MemoryItems.
+    Aggregated memories can update existing entries, so incremental add is not enough.
     """
-    global mem_index
+    global mem_index, _mem_index_loaded
 
     if items is None:
         items = _load_memories()
 
-    # 还没有任何记忆，建一个空 index 即可
+    model = _load_embedding_model()
+    if model is None:
+        _note_embedding_unavailable()
+        mem_index = None
+        _mem_index_loaded = True
+        if os.path.exists(MEMORY_INDEX_PATH):
+            try:
+                os.remove(MEMORY_INDEX_PATH)
+            except OSError:
+                pass
+        return
+
+    _mem_index_loaded = True
+
+    # No memory yet: create an empty index.
     if not items:
-        dummy = _emb_model.encode(
+        dummy = model.encode(
             ["query: dummy"], convert_to_numpy=True, normalize_embeddings=True
         )[0]
         d = len(dummy)
@@ -172,15 +251,15 @@ def _rebuild_mem_index(items: Optional[List[MemoryItem]] = None) -> None:
         _save_mem_index()
         return
 
-    # 正常重建
-    dummy = _emb_model.encode(
+    # Regular rebuild.
+    dummy = model.encode(
         ["query: dummy"], convert_to_numpy=True, normalize_embeddings=True
     )[0]
     d = len(dummy)
     mem_index = faiss.IndexFlatIP(d)
 
     texts = [f"passage: {m.text}" for m in items]
-    embs = _emb_model.encode(
+    embs = model.encode(
         texts,
         convert_to_numpy=True,
         normalize_embeddings=True,
@@ -192,30 +271,45 @@ def _rebuild_mem_index(items: Optional[List[MemoryItem]] = None) -> None:
 
 def reset_memories() -> None:
     """
-    清空所有记忆：
-    - 把 memories.json 重置为 []
-    - 把 mem_index 清空
+    Clear all memories:
+    - Reset memories.json to []
+    - Reset mem_index
     """
-    global mem_index
+    global mem_index, _mem_index_loaded
 
-    # 1) 重置 JSON 文件为合法的空数组
+    # 1) Reset JSON file to a valid empty array.
     with open(MEMORY_TEXTS_PATH, "w", encoding="utf-8") as f:
         json.dump([], f, ensure_ascii=False, indent=2)
 
-    # 2) 重置 Faiss index（保持维度不变）
-    d = mem_index.d  # 当前向量维度
+    # 2) Reset Faiss index (or remove index file if embeddings are unavailable).
+    model = _load_embedding_model()
+    if model is None:
+        _note_embedding_unavailable()
+        mem_index = None
+        _mem_index_loaded = True
+        if os.path.exists(MEMORY_INDEX_PATH):
+            try:
+                os.remove(MEMORY_INDEX_PATH)
+            except OSError:
+                pass
+        return
+
+    dummy = model.encode(
+        ["query: dummy"], convert_to_numpy=True, normalize_embeddings=True
+    )[0]
+    d = len(dummy)
     mem_index = faiss.IndexFlatIP(d)
     _save_mem_index()
 
 
-# ========== 槽分类 & 聚合器 ==========
+# ========== Slot Classification & Aggregators ==========
 
 class MemoryAggregator:
     """
-    通用聚合记忆基类：
-    - kind: 用于 extra["kind"] 标记聚合类型（如 'career_direction', 'profile_aggregate'）
-    - slot: 这个聚合记忆属于哪个槽（profile / preference / fact / recent）
-    - base_importance: 聚合记忆的基础重要度
+    Base class for aggregated memories:
+    - kind: stored in extra["kind"] (e.g. 'career_direction', 'profile_aggregate')
+    - slot: target memory slot (profile / preference / fact / recent)
+    - base_importance: default importance for aggregated entries
     """
     kind: str
     slot: MemorySlot
@@ -223,15 +317,15 @@ class MemoryAggregator:
 
     def extract_entities(self, text: str) -> List[str]:
         """
-        从一轮对话（question+answer）里抽取该聚合类型的“实体列表”。没有就返回 []。
-        子类必须重写。
+        Extract entity list for this aggregation type from one dialogue turn.
+        Return [] when no entity is found. Must be overridden by subclasses.
         """
         raise NotImplementedError
 
     def render_text(self, entities: List[str]) -> str:
         """
-        把实体列表渲染成一条人类可读的记忆文本。
-        子类可以重写。
+        Render entities as a human-readable memory text.
+        Can be overridden by subclasses.
         """
         return f"{self.kind}: " + ", ".join(entities)
 
@@ -243,11 +337,11 @@ class MemoryAggregator:
         source_turn: int,
     ) -> List[MemoryItem]:
         """
-        在 MemoryItem 列表里“更新/插入”一条聚合记忆：
-        - 找到 extra['kind'] == self.kind 的那条
-        - 合并实体列表
-        - 更新 text / last_used_at / importance
-        - 如果不存在就新建一条
+        Upsert one aggregated memory in MemoryItem list:
+        - Find existing item with extra['kind'] == self.kind
+        - Merge entities
+        - Update text / last_used_at / importance
+        - Create a new item if not found
         """
         raw = (question or "") + "\n" + (answer or "")
         entities = self.extract_entities(raw)
@@ -291,30 +385,31 @@ class MemoryAggregator:
 
 def classify_memory_slot(question: str, answer: str) -> tuple[MemorySlot, int]:
     """
-    粗暴版分类：
-    - 提到学校/专业/背景 → profile
-    - 提到“想做什么 / 想学什么 / 兴趣方向” → preference
-    - 明确的事实陈述（“我已经…”，“我打算…”）→ fact
-    - 其他默认 recent
-    importance: 2 = 很关键, 1 = 一般重要, 0 = 临时
+    Heuristic slot classifier:
+    - School/major/background -> profile
+    - Intent/interests/preferences -> preference
+    - Explicit factual decisions/plans -> fact
+    - Otherwise -> recent
+    importance: 2=high, 1=medium, 0=temporary
     """
-    q = question.lower()
-    a = answer.lower()
-    text = q + " " + a
+    q = (question or "").lower()
+    # Slot classification should prioritize user statement itself.
+    # Assistant text can be noisy and should not dominate slot assignment.
+    text = q
 
     # profile
-    if any(k in text for k in ["nyu", "tandon", "ece", "major", "degree", "master", "phd", "硕士", "博士"]):
+    if any(k in text for k in ["nyu", "tandon", "ece", "major", "degree", "master", "phd", "graduate"]):
         return "profile", 2
 
     # preference
-    if any(k in text for k in ["i want to learn", "i want to do", "i prefer", "我想学", "我想做", "我更想"]):
+    if any(k in text for k in ["i want to learn", "i want to do", "i prefer", "my interest is", "i'm interested in"]):
         return "preference", 2
 
     # important fact
-    if any(k in text for k in ["i decided", "i will", "i plan to", "我决定", "打算", "已经辞职", "已经报名"]):
+    if any(k in text for k in ["i decided", "i will", "i plan to", "i have enrolled", "i already switched"]):
         return "fact", 2
 
-    # 默认 recent
+    # default recent
     return "recent", 0
 
 
@@ -327,24 +422,24 @@ class CareerDirectionAggregator(MemoryAggregator):
         t = text.lower()
         dirs = set()
 
-        # AI infra / 系统底层
-        if any(k in t for k in ["ai infra", "ai infrastructure", "系统底层", "system-level", "low-level"]):
+        # AI infra / low-level systems
+        if any(k in t for k in ["ai infra", "ai infrastructure", "system-level", "low-level"]):
             dirs.add("AI infrastructure / low-level systems")
 
-        # 嵌入式
-        if any(k in t for k in ["embedded", "嵌入式"]):
+        # Embedded systems
+        if any(k in t for k in ["embedded"]):
             dirs.add("embedded systems")
 
-        # 分布式 / 存储 / GPU 调度
-        if any(k in t for k in ["distributed system", "distributed systems", "分布式"]):
+        # Distributed / storage / GPU scheduling
+        if any(k in t for k in ["distributed system", "distributed systems"]):
             dirs.add("distributed systems")
-        if any(k in t for k in ["storage", "存储"]):
+        if any(k in t for k in ["storage"]):
             dirs.add("storage systems")
-        if any(k in t for k in ["gpu 调度", "gpu scheduling", "gpu scheduler"]):
+        if any(k in t for k in ["gpu scheduling", "gpu scheduler"]):
             dirs.add("GPU scheduling")
 
-        # 芯片 / VLSI / ASIC / IC design
-        if any(k in t for k in ["芯片", "chip", "ic design", "集成电路"]):
+        # Chip / VLSI / ASIC / IC design
+        if any(k in t for k in ["chip", "ic design"]):
             dirs.add("chip / IC design")
         if "vlsi" in t:
             dirs.add("VLSI design")
@@ -372,7 +467,7 @@ class ProfileAggregator(MemoryAggregator):
             ents.add("ECE master's student")
         if "brooklyn" in t:
             ents.add("based in Brooklyn")
-        if "master" in t or "硕士" in t:
+        if "master" in t or "graduate" in t:
             ents.add("graduate student")
 
         return sorted(ents)
@@ -384,61 +479,83 @@ class ProfileAggregator(MemoryAggregator):
 AGGREGATORS: List[MemoryAggregator] = [
     CareerDirectionAggregator(),
     ProfileAggregator(),
-    # 以后你要加 SkillsAggregator、PreferenceAggregator，直接加到这里
+    # Add more aggregators here, e.g. SkillsAggregator, PreferenceAggregator.
 ]
 
 
-# ========== 写入记忆 & 检索记忆 ==========
+# ========== Memory Write & Retrieval ==========
 
 def add_memory_from_turn(question: str, answer: str, source_turn: int) -> None:
     """
-    每一轮问答结束后调用：
-    - question/answer 先拼 snippet，必要时用 Qwen 压缩
-    - 写一条“原始记忆条目”
-    - 让所有 AGGREGATOR 更新/生成聚合记忆
-    - 统一写回文件并重建 Faiss index
+    Called after every turn:
+    - Build a question/answer snippet and optionally summarize with Qwen
+    - Add one raw memory item
+    - Let all aggregators update/create aggregated memory items
+    - Persist data and rebuild Faiss index on schedule
     """
     snippet = _build_dialogue_snippet(question, answer)
-    # 超过 700 字做摘要
+    # Summarize when snippet is too long.
     if len(snippet) > 700:
         text = summarize_dialogue_with_qwen(snippet, max_words=80)
     else:
         text = snippet
 
-    # 1) 原始记忆条目
-    slot, importance = classify_memory_slot(question, answer)
-
     items = _load_memories()
-    new_id = (max((m.id for m in items), default=0) + 1) if items else 1
     now = datetime.utcnow().isoformat()
+    # 1) Raw memory item with dedup/merge.
+    slot, importance = classify_memory_slot(question, answer)
+    q_tokens = set(_tokenize(text))
+    duplicate: Optional[MemoryItem] = None
+    best_score = 0.0
 
-    raw_mem = MemoryItem(
-        id=new_id,
-        slot=slot,
-        text=text,
-        importance=importance,
-        created_at=now,
-        last_used_at=now,
-        extra={"source_turn": source_turn},
-    )
-    items.append(raw_mem)
+    for m in items:
+        # Dedup only on raw memory entries.
+        if m.extra.get("kind") is not None:
+            continue
+        m_tokens = set(_tokenize(m.text))
+        score = _jaccard(q_tokens, m_tokens)
+        if score > best_score:
+            best_score = score
+            duplicate = m
 
-    # 2) 跑所有 Aggregator，生成/更新聚合记忆条目
+    if duplicate is not None and best_score >= 0.82:
+        duplicate.last_used_at = now
+        duplicate.importance = max(duplicate.importance, importance)
+        duplicate.slot = duplicate.slot if duplicate.slot == slot else slot
+        duplicate.extra["source_turn"] = source_turn
+    else:
+        new_id = (max((m.id for m in items), default=0) + 1) if items else 1
+        raw_mem = MemoryItem(
+            id=new_id,
+            slot=slot,
+            text=text,
+            importance=importance,
+            created_at=now,
+            last_used_at=now,
+            extra={"source_turn": source_turn},
+        )
+        items.append(raw_mem)
+
+    # 2) Run all aggregators to update aggregated entries.
     for agg in AGGREGATORS:
         items = agg.upsert(items, question, answer, source_turn)
 
-    # 3) 统一落盘 + 重建向量索引
+    # 3) Persist and rebuild vector index on schedule.
     _save_memories(items)
-    _rebuild_mem_index(items)
+    # Keep index aligned with memory file to reduce fallback drift.
+    if MEMORY_REINDEX_EVERY <= 1:
+        _rebuild_mem_index(items)
+    elif source_turn % MEMORY_REINDEX_EVERY == 0:
+        _rebuild_mem_index(items)
 
 
 def _time_decay(slot: MemorySlot, created_at: str) -> float:
     """
-    根据创建时间和槽类型，算一个 [0, 1] 的时间权重。
+    Compute a [0,1] time weight using slot type and creation time.
     """
     expiry_days = MEMORY_EXPIRY_DAYS.get(slot)
     if expiry_days is None:
-        return 1.0  # 永不过期，时间权重恒 1
+        return 1.0  # never expires
 
     created = datetime.fromisoformat(created_at)
     now = datetime.utcnow()
@@ -449,64 +566,29 @@ def _time_decay(slot: MemorySlot, created_at: str) -> float:
     if delta_days >= expiry_days:
         return 0.0
 
-    # 简单线性衰减
+    # Simple linear decay.
     return max(0.0, 1.0 - delta_days / expiry_days)
 
 
-def retrieve_memories(
-    question: str,
-    top_k: int = 5,
-    alpha: float = 0.5,
-    beta: float = 1.0,
+def _time_decay_from_item(item: MemoryItem) -> float:
+    """
+    Prefer last-used freshness; fall back to creation time.
+    """
+    ts = item.last_used_at or item.created_at
+    try:
+        return _time_decay(item.slot, ts)
+    except Exception:
+        return _time_decay(item.slot, item.created_at)
+
+
+def _select_top_memories(
+    items: List[MemoryItem],
+    scored: List[tuple[float, MemoryItem]],
+    top_k: int,
 ) -> List[MemoryItem]:
-    """
-    检索记忆：
-    overall_score = embedding_sim + alpha * time_decay + beta * importance
-    embedding_sim = 内积结果（[-1,1]）
-    """
-    items = _load_memories()
-    if not items or mem_index.ntotal == 0:
-        return []
-
-    # query embedding
-    q_text = f"query: {question}"
-    q_emb = _emb_model.encode(
-        [q_text],
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    ).astype("float32")
-
-    # 向量检索
-    k = min(top_k * 4, mem_index.ntotal)  # 先拿多一点候选
-    sims, idxs = mem_index.search(q_emb, k)  # 内积 → sims 越大越相似
-    sims = sims[0]
-    idxs = idxs[0]
-
-    scored: List[tuple[float, MemoryItem]] = []
-
-    for sim, idx in zip(sims, idxs):
-        if idx < 0 or idx >= len(items):
-            continue
-        m = items[idx]
-        t_decay = _time_decay(m.slot, m.created_at)
-        imp = m.importance
-
-        overall = float(sim) + alpha * t_decay + beta * imp
-
-        # 聚合记忆加点额外偏置
-        kind = m.extra.get("kind")
-        if kind == "career_direction":
-            overall += 1.0
-        elif kind == "profile_aggregate":
-            overall += 0.8
-
-        scored.append((overall, m))
-
-    # 排序取前 top_k
     scored.sort(key=lambda x: x[0], reverse=True)
     top_items = [m for _, m in scored[:top_k]]
 
-    # 更新 last_used_at
     now = datetime.utcnow().isoformat()
     id_set = {m.id for m in top_items}
     for m in items:
@@ -517,9 +599,85 @@ def retrieve_memories(
     return top_items
 
 
+def retrieve_memories(
+    question: str,
+    top_k: int = 5,
+    alpha: float = 0.5,
+    beta: float = 0.4,
+) -> List[MemoryItem]:
+    """
+    Retrieve memories:
+    overall_score = embedding_sim + alpha * time_decay + beta * importance
+    embedding_sim = inner-product similarity ([-1,1])
+    """
+    items = _load_memories()
+    if not items:
+        return []
+
+    index = _ensure_mem_index(items)
+    model = _load_embedding_model()
+    # Index missing/model unavailable/empty/mismatch -> lexical fallback.
+    # This works with periodic rebuild in add_memory_from_turn.
+    if index is None or model is None or index.ntotal == 0 or index.ntotal != len(items):
+        q_tokens = set(_tokenize(question))
+        scored: List[tuple[float, MemoryItem]] = []
+        for m in items:
+            sim = _lexical_score(q_tokens, m.text)
+            t_decay = _time_decay_from_item(m)
+            imp = m.importance
+
+            overall = float(sim) + alpha * t_decay + beta * imp
+
+            kind = m.extra.get("kind")
+            if kind == "career_direction":
+                overall += 0.35
+            elif kind == "profile_aggregate":
+                overall += 0.25
+
+            scored.append((overall, m))
+
+        return _select_top_memories(items, scored, top_k)
+
+    # Query embedding.
+    q_text = f"query: {question}"
+    q_emb = model.encode(
+        [q_text],
+        convert_to_numpy=True,
+        normalize_embeddings=True,
+    ).astype("float32")
+
+    # Vector retrieval.
+    k = min(top_k * 4, index.ntotal)  # retrieve extra candidates first
+    sims, idxs = index.search(q_emb, k)  # inner product: larger is more similar
+    sims = sims[0]
+    idxs = idxs[0]
+
+    scored: List[tuple[float, MemoryItem]] = []
+
+    for sim, idx in zip(sims, idxs):
+        if idx < 0 or idx >= len(items):
+            continue
+        m = items[idx]
+        t_decay = _time_decay_from_item(m)
+        imp = m.importance
+
+        overall = float(sim) + alpha * t_decay + beta * imp
+
+        # Extra bias for aggregated memories.
+        kind = m.extra.get("kind")
+        if kind == "career_direction":
+            overall += 0.35
+        elif kind == "profile_aggregate":
+            overall += 0.25
+
+        scored.append((overall, m))
+
+    return _select_top_memories(items, scored, top_k)
+
+
 def format_memories_block(mem_items: List[MemoryItem]) -> str:
     """
-    把若干 MemoryItem 格式化成一个多行字符串，方便塞进 Qwen prompt。
+    Format memory items into a multi-line string for Qwen prompts.
     """
     if not mem_items:
         return "(No retrieved memories.)"
@@ -529,6 +687,13 @@ def format_memories_block(mem_items: List[MemoryItem]) -> str:
     return "\n".join(lines)
 
 
+def export_all_memories() -> List[Dict[str, Any]]:
+    """
+    Return raw dict list for all current memory items (for logging/export).
+    """
+    return [asdict(m) for m in _load_memories()]
+
+
 __all__ = [
     "MemoryItem",
     "MemorySlot",
@@ -536,4 +701,5 @@ __all__ = [
     "add_memory_from_turn",
     "retrieve_memories",
     "format_memories_block",
+    "export_all_memories",
 ]

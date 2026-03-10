@@ -200,6 +200,7 @@
             color: var(--nyu-violet);
             font-weight: 700;
             font-size: 13px;
+            cursor: pointer;
         }
         .schedule-open-btn {
             border: none;
@@ -578,6 +579,7 @@
             textarea.style.height = "auto";
             
             const answerContainer = createPendingQA(currentQuestion);
+            let scheduleWindow = null;
 
             try {
                 const resp = await fetch("/ask", {
@@ -590,17 +592,25 @@
                     const txt = await resp.text();
                     answerContainer.textContent = "Error: " + txt;
                     answerContainer.style.color = "#d32f2f";
+                    if (scheduleWindow && !scheduleWindow.closed) {
+                        scheduleWindow.close();
+                    }
                 } else {
                     const data = await resp.json();
                     if (data.error) {
                         answerContainer.textContent = "Error: " + data.error;
                         answerContainer.style.color = "#d32f2f";
+                        if (scheduleWindow && !scheduleWindow.closed) {
+                            scheduleWindow.close();
+                        }
                     } else {
                         const scheduleHtml = data.schedule_html;
                         const conflicts = data.conflicts || [];
                         typeWriter(answerContainer, data.answer || "", () => {
                             if (scheduleHtml) {
-                                renderScheduleEmbed(answerContainer, scheduleHtml, conflicts);
+                                renderScheduleEmbed(answerContainer, scheduleHtml, conflicts, scheduleWindow);
+                            } else if (scheduleWindow && !scheduleWindow.closed) {
+                                scheduleWindow.close();
                             }
                         });
                     }
@@ -609,6 +619,9 @@
                 console.error(err);
                 answerContainer.textContent = "Network Error. Check backend.";
                 answerContainer.style.color = "#d32f2f";
+                if (scheduleWindow && !scheduleWindow.closed) {
+                    scheduleWindow.close();
+                }
             } finally {
                 isSending = false;
                 updateSendButtonState();
@@ -644,43 +657,87 @@
             type();
         }
 
-        function renderScheduleEmbed(container, scheduleHtml, conflicts) {
+        function renderScheduleEmbed(container, scheduleHtml, conflicts, openedWindow) {
+            function openScheduleWindow(triggerDownload = false) {
+                let target = window.open("", "_blank");
+                if (!target) return null;
+                target.document.open();
+                target.document.write(scheduleHtml);
+                target.document.close();
+                target.focus();
+                if (triggerDownload) {
+                    setTimeout(() => {
+                        try {
+                            if (typeof target.downloadScheduleImage === "function") {
+                                target.downloadScheduleImage();
+                            }
+                        } catch (e) {
+                            console.warn("Download trigger failed", e);
+                        }
+                    }, 700);
+                }
+                return target;
+            }
+
+            let target = openedWindow;
+            if (target && !target.closed && target.document) {
+                target.document.open();
+                target.document.write(scheduleHtml);
+                target.document.close();
+                target.focus();
+            } else {
+                target = openScheduleWindow(false);
+            }
+
             const block = document.createElement("div");
             block.className = "schedule-block";
-
             const header = document.createElement("div");
             header.className = "schedule-block__header";
-            header.textContent = "Generated Schedule";
-
-            const link = document.createElement("a");
-            const blob = new Blob([scheduleHtml], { type: "text/html" });
-            const url = URL.createObjectURL(blob);
-            link.href = url;
-            link.target = "_blank";
-            link.rel = "noopener";
-            link.className = "schedule-open-btn";
-            link.textContent = "Open in new tab";
-            link.addEventListener("click", () => {
-                setTimeout(() => URL.revokeObjectURL(url), 30000);
+            header.textContent = "Schedule opened in a new tab";
+            header.title = "Click to reopen schedule tab";
+            header.addEventListener("click", () => {
+                openScheduleWindow(false);
             });
 
-            header.appendChild(link);
+            const actions = document.createElement("div");
 
-            const frame = document.createElement("iframe");
-            frame.className = "schedule-frame";
-            frame.setAttribute("sandbox", "allow-same-origin allow-popups");
-            frame.srcdoc = scheduleHtml;
+            const reopenBtn = document.createElement("button");
+            reopenBtn.className = "schedule-open-btn";
+            reopenBtn.textContent = "Reopen Tab";
+            reopenBtn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                openScheduleWindow(false);
+            });
 
+            const downloadBtn = document.createElement("button");
+            downloadBtn.className = "schedule-open-btn";
+            downloadBtn.style.marginLeft = "8px";
+            downloadBtn.textContent = "Download Schedule Image";
+            downloadBtn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                openScheduleWindow(true);
+            });
+
+            actions.appendChild(reopenBtn);
+            actions.appendChild(downloadBtn);
+            header.appendChild(actions);
             block.appendChild(header);
-            block.appendChild(frame);
 
             if (Array.isArray(conflicts) && conflicts.length) {
                 const conflictNote = document.createElement("div");
                 conflictNote.style.padding = "10px 14px";
                 conflictNote.style.fontSize = "12px";
                 conflictNote.style.color = "#c62828";
-                conflictNote.textContent = `${conflicts.length} conflict(s) detected. See highlights in the schedule.`;
+                conflictNote.textContent = `${conflicts.length} conflict(s) detected in the generated schedule.`;
                 block.appendChild(conflictNote);
+            }
+
+            if (!target) {
+                const hint = document.createElement("div");
+                hint.style.padding = "10px 14px";
+                hint.style.fontSize = "12px";
+                hint.textContent = "Popup was blocked by the browser. Please allow popups and retry.";
+                block.appendChild(hint);
             }
 
             container.appendChild(block);
