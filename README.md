@@ -216,12 +216,6 @@ Unit tests:
 pytest test.py -q
 ```
 
-Integration tests (requires reachable local Qwen API):
-
-```bash
-QWEN_TEST_ENABLED=1 pytest test_integration_qwen.py -q -m integration
-```
-
 Smoke tests:
 
 ```bash
@@ -249,4 +243,4 @@ From `config/paths.py`:
 
 ## License
 
-Add your preferred license (e.g., MIT) before publishing.
+MIT License. See [`LICENSE`](LICENSE).
